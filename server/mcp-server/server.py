@@ -260,8 +260,8 @@ def weapi_encrypt(payload):
     rs = pow(int(secret[::-1].hex(), 16), _WEAPI_PUB_E, _WEAPI_MODULUS)
     return {'params': params, 'encSecKey': format(rs, 'x').zfill(256)}
 
-def netease_weapi(path, payload=None):
-    """Make an authenticated weapi (encrypted) request. path like '/playlist/create'."""
+def netease_weapi(path, payload=None, os_override=None):
+    """Make an authenticated weapi request; optionally override the device OS cookie."""
     csrf = get_csrf()
     payload = dict(payload or {}, csrf_token=csrf)
     url = f'https://music.163.com/weapi{path}?csrf_token={csrf}'
@@ -272,6 +272,12 @@ def netease_weapi(path, payload=None):
         'Referer': 'https://music.163.com/',
         'Origin': 'https://music.163.com',
     }
+    if os_override:
+        # NetEase's comment-submit API uses an Android client cookie in popular
+        # community implementations; don't alter credentials or other requests.
+        jar = _parse_cookie(headers['Cookie'])
+        jar['os'] = os_override
+        headers['Cookie'] = '; '.join(f'{key}={value}' for key, value in jar.items())
     try:
         body = urllib.parse.urlencode(weapi_encrypt(payload)).encode()
         req = urllib.request.Request(url, data=body, headers=headers, method='POST')
@@ -661,6 +667,76 @@ def get_liked_songs(params):
 
 
 
+
+# --- Playlist comments (community NetEase API; may change upstream) ---
+def _comment_playlist_id(params):
+    """Return a safe numerical playlist ID, or None for invalid input."""
+    raw = str(params.get('playlist_id', '')).strip()
+    if not raw.isascii() or not raw.isdecimal():
+        return None
+    pid = int(raw)
+    return pid if pid > 0 else None
+
+
+def get_playlist_comments(params):
+    """Read comments on a NetEase playlist; never changes account data."""
+    pid = _comment_playlist_id(params)
+    if pid is None:
+        return {"error": "A positive numeric playlist_id is required"}
+    try:
+        limit = min(50, max(1, int(params.get('limit', 20))))
+        offset = max(0, int(params.get('offset', 0)))
+    except (TypeError, ValueError):
+        return {"error": "limit and offset must be integers"}
+    # Source: NeteaseCloudMusicApi module/comment_playlist.js
+    result = netease_weapi('/v1/resource/comments/A_PL_0_' + str(pid),
+                           {'rid': str(pid), 'limit': limit, 'offset': offset, 'beforeTime': 0})
+    if not isinstance(result, dict) or result.get('code') != 200:
+        return {"error": "Failed to read playlist comments", "detail": _with_hint(result) if isinstance(result, dict) else result}
+    comments = result.get('comments') or []
+    out = []
+    for c in comments[:limit]:
+        u = c.get('user') or {}
+        out.append({
+            'comment_id': c.get('commentId'),
+            'nickname': u.get('nickname', 'Unknown'),
+            'content': c.get('content', ''),
+            'time': c.get('timeStr') or _fmt_time(c.get('time')),
+            'liked_count': c.get('likedCount', 0),
+            'replies': [
+                {'nickname': (reply.get('user') or {}).get('nickname', 'Unknown'),
+                 'content': reply.get('content', '')}
+                for reply in (c.get('beReplied') or [])[:3]
+            ],
+        })
+    return {'playlist_id': pid, 'total': result.get('total'),
+            'comments': out, 'offset': offset, 'has_more': bool(result.get('more', False))}
+
+
+def send_playlist_comment(params):
+    """Publish a comment from the connected NetEase account. Call only on explicit user approval."""
+    pid = _comment_playlist_id(params)
+    if pid is None:
+        return {"error": "A positive numeric playlist_id is required"}
+    content = params.get('content')
+    if not isinstance(content, str) or not content.strip():
+        return {"error": "Non-empty comment content is required"}
+    content = content.strip()
+    if len(content) > 300:
+        return {"error": "Comment exceeds 300 characters"}
+    # Source: NeteaseCloudMusicApi module/comment.js. The post is signed as the
+    # currently configured NetEase account; this does NOT create an AI identity.
+    result = netease_weapi('/resource/comments/add',
+                           {'threadId': 'A_PL_0_' + str(pid), 'content': content},
+                           os_override='android')
+    if not isinstance(result, dict) or result.get('code') != 200:
+        return {"error": "Comment submission failed or is unconfirmed; check NetEase before retrying",
+                "detail": _with_hint(result) if isinstance(result, dict) else result}
+    comment = result.get('comment') or {}
+    return {'status': 'posted', 'playlist_id': pid,
+            'comment_id': comment.get('commentId'), 'content': content,
+            'note': 'Posted using the connected NetEase account, not a separate AI account.'}
+
 # --- Tool Registry ---
 TOOLS = [
     {"name": "search_song", "description": "Search songs by keyword. Returns a list of matching songs with IDs.",
@@ -699,6 +775,17 @@ TOOLS = [
      "inputSchema": {"type": "object", "properties": {}}},
     {"name": "get_liked_songs", "description": "Get all liked (red-heart) song IDs for the current user.",
      "inputSchema": {"type": "object", "properties": {}}},
+    {"name": "get_playlist_comments", "description": "Read recent comments on a NetEase playlist. Read-only, no posting.",
+     "inputSchema": {"type": "object", "properties": {
+         "playlist_id": {"type": "integer", "description": "NetEase playlist ID"},
+         "limit": {"type": "integer", "description": "Comments per page, maximum 50 (default 20)"},
+         "offset": {"type": "integer", "description": "Pagination offset (default 0)"}},
+         "required": ["playlist_id"]}},
+    {"name": "send_playlist_comment", "description": "Post a comment using the user's NetEase account. ONLY call after the user explicitly approves the exact comment text and target playlist. This is a public account action, not a separate AI identity.",
+     "inputSchema": {"type": "object", "properties": {
+         "playlist_id": {"type": "integer", "description": "NetEase playlist ID"},
+         "content": {"type": "string", "description": "Exact approved comment text, max 300 characters"}},
+         "required": ["playlist_id", "content"]}},
 ]
 
 TOOL_DISPATCH = {
@@ -720,6 +807,8 @@ TOOL_DISPATCH = {
     "get_artist_hot_songs": get_artist_hot_songs,
     "get_personal_fm": get_personal_fm,
     "get_liked_songs": get_liked_songs,
+    "get_playlist_comments": get_playlist_comments,
+    "send_playlist_comment": send_playlist_comment,
 }
 
 # --- MCP Protocol Handler ---
