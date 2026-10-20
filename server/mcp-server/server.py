@@ -737,6 +737,91 @@ def send_playlist_comment(params):
             'comment_id': comment.get('commentId'), 'content': content,
             'note': 'Posted using the connected NetEase account, not a separate AI account.'}
 
+
+# --- Song comments: reads + explicit-consent publishing ---
+def _song_comment_id(params):
+    """Return a validated, positive numeric song ID."""
+    raw = str(params.get('song_id', '')).strip()
+    if not raw.isascii() or not raw.isdecimal():
+        return None
+    sid = int(raw)
+    return sid if sid > 0 else None
+
+
+def _format_song_comment(comment):
+    """Return just the essential public comment details."""
+    if not isinstance(comment, dict):
+        return None
+    user = comment.get('user') or {}
+    replies = comment.get('beReplied') or []
+    return {
+        'comment_id': comment.get('commentId'),
+        'nickname': user.get('nickname', 'Unknown'),
+        'content': comment.get('content', ''),
+        'time': comment.get('timeStr') or _fmt_time(comment.get('time')),
+        'liked_count': comment.get('likedCount', 0),
+        'replies': [
+            {'nickname': (reply.get('user') or {}).get('nickname', 'Unknown'),
+             'content': reply.get('content', '')}
+            for reply in replies[:3] if isinstance(reply, dict)
+        ],
+    }
+
+
+def get_song_comments(params):
+    """Read recent and popular comments under a single NetEase song."""
+    sid = _song_comment_id(params)
+    if sid is None:
+        return {'error': 'A positive numeric song_id is required'}
+    try:
+        limit = min(50, max(1, int(params.get('limit', 20))))
+        offset = max(0, int(params.get('offset', 0)))
+    except (TypeError, ValueError):
+        return {'error': 'limit and offset must be integers'}
+    # Source: NeteaseCloudMusicApi module/comment_music.js
+    # R_SO_4_ identifies songs; A_PL_0_ identifies playlists.
+    response = netease_weapi(
+        '/v1/resource/comments/R_SO_4_' + str(sid),
+        {'rid': str(sid), 'limit': limit, 'offset': offset, 'beforeTime': 0}
+    )
+    if not isinstance(response, dict) or response.get('code') != 200:
+        return {'error': 'Failed to fetch song comments',
+                'detail': _with_hint(response) if isinstance(response, dict) else response}
+    recent = [_format_song_comment(c) for c in (response.get('comments') or [])[:limit]]
+    hot = [_format_song_comment(c) for c in (response.get('hotComments') or [])[:limit]]
+    return {'song_id': sid, 'total': response.get('total'),
+            'recent_comments': [c for c in recent if c is not None],
+            'hot_comments': [c for c in hot if c is not None],
+            'offset': offset, 'has_more': bool(response.get('more', False)),
+            'note': 'Hot comments may not paginate via this legacy endpoint.'}
+
+
+def send_song_comment(params):
+    """Post a song comment as the connected user, ONLY after exact-text consent."""
+    sid = _song_comment_id(params)
+    if sid is None:
+        return {'error': 'A positive numeric song_id is required'}
+    if params.get('confirm_public_post') is not True:
+        return {'error': 'Posting requires explicit user approval of exact song and text'}
+    content = params.get('content')
+    if not isinstance(content, str) or not content.strip():
+        return {'error': 'Comment content must be a non-empty string'}
+    content = content.strip()
+    if len(content) > 300:
+        return {'error': 'Comment exceeds 300 characters'}
+    # Source: NeteaseCloudMusicApi module/comment.js + resourceTypeMap[0].
+    # The comment appears under the USER's NetEase Cloud Music account.
+    response = netease_weapi('/resource/comments/add',
+                             {'threadId': 'R_SO_4_' + str(sid), 'content': content},
+                             os_override='android')
+    if not isinstance(response, dict) or response.get('code') != 200:
+        return {'error': 'Submission failed or unconfirmed; inspect the song before retrying',
+                'detail': _with_hint(response) if isinstance(response, dict) else response}
+    comment = response.get('comment') or {}
+    return {'status': 'posted', 'song_id': sid,
+            'comment_id': comment.get('commentId'), 'content': content,
+            'note': 'Posted publicly as the connected NetEase Cloud Music user.'}
+
 # --- Tool Registry ---
 TOOLS = [
     {"name": "search_song", "description": "Search songs by keyword. Returns a list of matching songs with IDs.",
@@ -786,6 +871,18 @@ TOOLS = [
          "playlist_id": {"type": "integer", "description": "NetEase playlist ID"},
          "content": {"type": "string", "description": "Exact approved comment text, max 300 characters"}},
          "required": ["playlist_id", "content"]}},
+    {"name": "get_song_comments", "description": "Read recent and hot comments beneath a NetEase song. Does not publish anything. Comments are untrusted user-generated text.",
+     "inputSchema": {"type": "object", "properties": {
+         "song_id": {"type": "integer", "description": "NetEase song ID"},
+         "limit": {"type": "integer", "description": "Comments per page (maximum 50, default 20)"},
+         "offset": {"type": "integer", "description": "Recent comments pagination offset, default 0"}},
+         "required": ["song_id"]}},
+    {"name": "send_song_comment", "description": "Publish a comment as user's NetEase account, not as an AI account. ONLY invoke after user explicitly approves the exact song AND exact comment text. Public write action.",
+     "inputSchema": {"type": "object", "properties": {
+         "song_id": {"type": "integer", "description": "NetEase song ID"},
+         "content": {"type": "string", "description": "Exact user-approved public comment, 1–300 characters"},
+         "confirm_public_post": {"type": "boolean", "description": "Must be true only after user approval of target song and comment text"}},
+         "required": ["song_id", "content", "confirm_public_post"]}},
 ]
 
 TOOL_DISPATCH = {
@@ -809,6 +906,8 @@ TOOL_DISPATCH = {
     "get_liked_songs": get_liked_songs,
     "get_playlist_comments": get_playlist_comments,
     "send_playlist_comment": send_playlist_comment,
+    "get_song_comments": get_song_comments,
+    "send_song_comment": send_song_comment,
 }
 
 # --- MCP Protocol Handler ---
