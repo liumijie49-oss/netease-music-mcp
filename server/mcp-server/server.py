@@ -48,6 +48,10 @@ NETEASE_COOKIE = os.environ.get("NETEASE_COOKIE", "")
 NETEASE_CSRF = os.environ.get("NETEASE_CSRF", "")
 NETEASE_UID = os.environ.get("NETEASE_UID", "")  # optional; looked up automatically if empty
 PORT = int(os.environ.get("MCP_PORT", "3456"))
+# A private, random 40+ character token configured in Railway Variables, NEVER in GitHub.
+# ChatGPT can connect using https://YOUR-DOMAIN/mcp/YOUR_TOKEN with "No authentication".
+# The secret URL itself is a credential; do not share it or log it.
+MCP_ACCESS_TOKEN = os.environ.get("MCP_ACCESS_TOKEN", "").strip()
 LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO").upper()
 SESSION_ID = str(uuid.uuid4())
 try:
@@ -736,14 +740,27 @@ class MCPHandler(http.server.BaseHTTPRequestHandler):
         self.send_response(204)
         self._cors()
         self.end_headers()
+    def _authorized_mcp_path(self):
+        # Fail closed when the secret is not configured or is too short.
+        # Use a constant-time comparison and accept only the exact MCP endpoint.
+        if len(MCP_ACCESS_TOKEN) < 40:
+            return False
+        path = urllib.parse.urlsplit(self.path).path
+        return secrets.compare_digest(path, '/mcp/' + MCP_ACCESS_TOKEN)
     def do_GET(self):
         if self.path == '/health':
+            # No account data is returned; this is only for deployment health checks.
             self._json_response({"status": "ok", "tools": len(TOOLS), "version": VERSION})
-        elif self.path == '/sse':
-            self._handle_sse()
+        elif self._authorized_mcp_path():
+            # Streamable HTTP clients may probe GET; the stream is optional.
+            self._json_response({"error": "Use POST for MCP requests"}, 405)
         else:
+            # Disable the original unauthenticated /sse endpoint.
             self._json_response({"error": "Not found"}, 404)
     def do_POST(self):
+        if not self._authorized_mcp_path():
+            self._json_response({"error": "Not found"}, 404)
+            return
         length = int(self.headers.get('Content-Length', 0))
         body = json.loads(self.rfile.read(length)) if length else {}
         method = body.get('method', '')
@@ -816,6 +833,10 @@ class ThreadedHTTPServer(HTTPServer):
 
 def _startup_checks():
     """Log which credentials were found (key names only, never values)."""
+    if len(MCP_ACCESS_TOKEN) < 40:
+        logger.warning("MCP_ACCESS_TOKEN missing or too short: ALL MCP requests will be rejected")
+    else:
+        logger.info("MCP private URL protection is enabled")
     jar = _parse_cookie(NETEASE_COOKIE)
     logger.info("Cookie keys provided: " + (", ".join(sorted(jar)) or "(none)"))
     if 'MUSIC_U' not in jar:
